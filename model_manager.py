@@ -30,41 +30,85 @@ class ExpertUtilizationMonitor:
         self.hooks = []
     
     def register_hooks(self, model):
-        """Register hooks to monitor expert utilization - simplified for interview."""
+        """Register hooks to monitor expert utilization - fixed for OLMoE."""
         def router_hook(module, input, output):
+            router_logits = None
+            
+            # Method 1: Check if output has router_logits attribute
             if hasattr(output, 'router_logits') and output.router_logits is not None:
-                # Simple expert usage tracking
-                router_probs = F.softmax(output.router_logits, dim=-1)
-                expert_usage = router_probs.mean(dim=0)
-                entropy = -torch.sum(router_probs * torch.log(router_probs + 1e-8), dim=-1).mean()
-                
-                # Store key metrics only
-                self.expert_stats['expert_usage'].append(expert_usage.detach().cpu())
-                self.expert_stats['routing_entropy'].append(entropy.detach().cpu())
+                router_logits = output.router_logits
+            
+            # Method 2: OLMoE specific - router logits are second element in tuple
+            elif isinstance(output, tuple) and len(output) >= 2:
+                potential_router = output[1]
+                # Verify this looks like router logits (should have num_experts dimension)
+                if hasattr(potential_router, 'shape') and len(potential_router.shape) >= 2:
+                    # Router logits typically have shape [..., num_experts]
+                    if potential_router.shape[-1] == 64:  # OLMoE has 64 experts
+                        router_logits = potential_router
+            
+            if router_logits is not None:
+                try:
+                    # Calculate expert usage and entropy
+                    router_probs = F.softmax(router_logits, dim=-1)
+                    
+                    # Average over all dimensions except the expert dimension
+                    if len(router_probs.shape) == 2:  # [seq_len, num_experts]
+                        expert_usage = router_probs.mean(dim=0)  # Average over sequence
+                    elif len(router_probs.shape) == 3:  # [batch, seq_len, num_experts]
+                        expert_usage = router_probs.mean(dim=(0, 1))  # Average over batch and sequence
+                    else:
+                        expert_usage = router_probs.mean(dim=tuple(range(len(router_probs.shape)-1)))
+                    
+                    # Calculate routing entropy
+                    entropy = -torch.sum(router_probs * torch.log(router_probs + 1e-8), dim=-1).mean()
+                    
+                    # Store metrics
+                    self.expert_stats['expert_usage'].append(expert_usage.detach().cpu())
+                    self.expert_stats['routing_entropy'].append(entropy.detach().cpu())
+                    
+                except Exception as e:
+                    logger.debug(f"Error processing router logits: {e}")
         
-        # Find and hook MoE layers
+        # Find and hook MoE layers - be more selective to avoid hooking sub-modules
+        hooked_count = 0
         for name, module in model.named_modules():
-            if 'mlp' in name.lower():
+            # Hook only the main MLP layers, not their sub-components
+            if (name.endswith('.mlp') and 
+                'layers.' in name and 
+                not any(x in name for x in ['experts.', 'gate.', 'proj'])):
                 hook = module.register_forward_hook(router_hook)
                 self.hooks.append(hook)
+                hooked_count += 1
         
-        logger.info(f"Registered {len(self.hooks)} expert monitoring hooks")
+        logger.info(f"Registered {hooked_count} expert monitoring hooks on MoE layers")
     
     def get_expert_metrics(self) -> Dict:
-        """Get simple expert utilization metrics for interview demo."""
+        """Get comprehensive expert utilization metrics."""
         if not self.expert_stats['expert_usage']:
             return {}
         
-        # Get recent statistics (last 5 steps)
+        # Get recent statistics (last 5 steps or all if fewer)
         recent_usage = self.expert_stats['expert_usage'][-5:]
         recent_entropy = self.expert_stats['routing_entropy'][-5:]
         
         if recent_usage:
+            # Stack usage tensors and compute statistics
             avg_usage = torch.stack(recent_usage).mean(dim=0)
+            
+            # Calculate comprehensive metrics
+            max_usage = torch.max(avg_usage).item()
+            min_usage = torch.min(avg_usage).item()
+            usage_ratio = max_usage / (min_usage + 1e-8)  # Imbalance ratio
+            
             return {
                 'num_experts': len(avg_usage),
                 'routing_entropy': torch.tensor(recent_entropy).mean().item(),
-                'expert_usage_std': torch.std(avg_usage).item(),  # How balanced?
+                'expert_usage_std': torch.std(avg_usage).item(),
+                'expert_max_usage': max_usage,
+                'expert_min_usage': min_usage,
+                'expert_usage_ratio': usage_ratio,
+                'total_routing_calls': len(self.expert_stats['expert_usage'])
             }
         return {}
     

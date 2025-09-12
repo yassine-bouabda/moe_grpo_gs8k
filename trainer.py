@@ -6,7 +6,7 @@ import gc
 import torch
 import logging
 from trl import GRPOConfig, GRPOTrainer
-from transformers import set_seed
+from transformers import set_seed, TrainerCallback
 
 from config import TrainingConfig
 from model_manager import ModelManager
@@ -21,6 +21,30 @@ except ImportError:
     WANDB_AVAILABLE = False
 
 logger = logging.getLogger(__name__)
+
+
+class ExpertMonitoringCallback(TrainerCallback):
+    """Callback to monitor expert utilization during training."""
+    
+    def __init__(self, expert_monitor):
+        self.expert_monitor = expert_monitor
+    
+    def on_log(self, args, state, control, logs=None, **kwargs):
+        """Log expert metrics during training."""
+        if logs is not None:
+            expert_metrics = self.expert_monitor.get_expert_metrics()
+            if expert_metrics:
+                # Add expert metrics to logs
+                for key, value in expert_metrics.items():
+                    logs[f"experts/{key}"] = value
+                
+                # Console logging for key metrics
+                entropy = expert_metrics.get('routing_entropy', 0)
+                std = expert_metrics.get('expert_usage_std', 0)
+                ratio = expert_metrics.get('expert_usage_ratio', 0)
+                calls = expert_metrics.get('total_routing_calls', 0)
+                
+                logger.info(f"Expert Utilization - Entropy: {entropy:.3f}, Std: {std:.3f}, Ratio: {ratio:.2f}, Calls: {calls}")
 
 
 class GRPOTrainingPipeline:
@@ -128,6 +152,10 @@ class GRPOTrainingPipeline:
             args=grpo_config,
             train_dataset=self.train_dataset,
         )
+        
+        # Add expert monitoring callback
+        expert_callback = ExpertMonitoringCallback(self.model_manager.expert_monitor)
+        trainer.add_callback(expert_callback)
         
         # Train
         train_output = trainer.train()
