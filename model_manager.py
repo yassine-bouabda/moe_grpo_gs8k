@@ -153,14 +153,13 @@ class ModelManager:
         # Load model with quantization
         model = AutoModelForCausalLM.from_pretrained(
             self.config.model_name,
-            quantization_config=bnb_config,
             device_map="auto",
             trust_remote_code=True,
             torch_dtype=torch.bfloat16 if self.config.use_bf16 else torch.float16,
         )
         
         # Prepare model for k-bit training
-        model = prepare_model_for_kbit_training(model)
+        #model = prepare_model_for_kbit_training(model)
         
         # Configure LoRA
         lora_config = LoraConfig(
@@ -171,10 +170,13 @@ class ModelManager:
             task_type="CAUSAL_LM",
             target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],  # Standard attention modules
         )
+
+        # Expose for external access (e.g., GRPOTrainer)
+        self.peft_config = lora_config
         
         # Apply LoRA
-        model = get_peft_model(model, lora_config)
-        model.print_trainable_parameters()
+        #model = get_peft_model(model, lora_config)
+        #model.print_trainable_parameters()
         
         # Ensure generation config is properly set
         if hasattr(model, 'generation_config'):

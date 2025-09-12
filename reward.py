@@ -26,7 +26,7 @@ class GSM8KRewardFunction:
     """Calculates rewards for generated completions."""
     
     def __init__(self, answer_map: Dict[str, int]):
-        self.answer_map = answer_map
+        self.answer_map = answer_map 
         
     def calculate_rewards(
         self, 

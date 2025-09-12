@@ -13,12 +13,10 @@ from model_manager import ModelManager
 from data_processor import GSM8KDataProcessor
 from reward import GSM8KRewardFunction
 
-# Optional wandb import
-try:
-    import wandb
-    WANDB_AVAILABLE = True
-except ImportError:
-    WANDB_AVAILABLE = False
+
+import wandb
+WANDB_AVAILABLE = True
+
 
 logger = logging.getLogger(__name__)
 
@@ -38,6 +36,13 @@ class ExpertMonitoringCallback(TrainerCallback):
                 for key, value in expert_metrics.items():
                     logs[f"experts/{key}"] = value
                 
+                # Log directly to wandb to guarantee persistence
+                if WANDB_AVAILABLE and wandb.run is not None:
+                    wandb.log(
+                {f"experts/{k}": float(v) for k, v in expert_metrics.items()},
+                commit=True,  # force flush each call
+            )
+                
                 # Console logging for key metrics
                 entropy = expert_metrics.get('routing_entropy', 0)
                 std = expert_metrics.get('expert_usage_std', 0)
@@ -45,6 +50,26 @@ class ExpertMonitoringCallback(TrainerCallback):
                 calls = expert_metrics.get('total_routing_calls', 0)
                 
                 logger.info(f"Expert Utilization - Entropy: {entropy:.3f}, Std: {std:.3f}, Ratio: {ratio:.2f}, Calls: {calls}")
+
+
+class GradientDebugCallback(TrainerCallback):
+    """Callback that prints true gradient norm to verify gradients flow."""
+    def on_step_end(self, args, state, control, **kwargs):
+        model = kwargs.get('model')
+        if model is None:
+            return
+        total_norm = 0.0
+        num_params = 0
+        for p in model.parameters():
+            if p.requires_grad and p.grad is not None:
+                param_norm = p.grad.data.float().norm(2)
+                total_norm += param_norm.item() ** 2
+                num_params += 1
+        if num_params > 0:
+            total_norm = total_norm ** 0.5
+            logger.info(f"[GradDebug] True grad-norm L2: {total_norm:.4e} over {num_params} tensors")
+        else:
+            logger.warning("[GradDebug] No gradients found on any trainable parameter!")
 
 
 class GRPOTrainingPipeline:
@@ -64,6 +89,11 @@ class GRPOTrainingPipeline:
         # Initialize components
         self.model_manager = ModelManager(config)
         self.model, self.tokenizer = self.model_manager.setup_model_and_tokenizer()
+
+        # ------------------------------------------------------------------
+        # Debug helper: print parameter statistics BEFORE any training begins
+        # ------------------------------------------------------------------
+        self._log_trainable_parameters()
         
         self.data_processor = GSM8KDataProcessor(self.tokenizer)
         self.train_dataset = self.data_processor.load_and_prepare_dataset()
@@ -126,7 +156,7 @@ class GRPOTrainingPipeline:
             top_p=self.config.top_p,
             
             # Simple optimization settings
-            max_grad_norm=0.5,  # Prevent gradient explosions
+            max_grad_norm=1.0,  # Allow larger gradients for LoRA layers
             
             # Logging
             logging_steps=self.config.logging_steps,
@@ -151,11 +181,15 @@ class GRPOTrainingPipeline:
             reward_funcs=[self.reward_function.calculate_rewards],
             args=grpo_config,
             train_dataset=self.train_dataset,
+            peft_config=self.model_manager.peft_config,
         )
         
         # Add expert monitoring callback
         expert_callback = ExpertMonitoringCallback(self.model_manager.expert_monitor)
         trainer.add_callback(expert_callback)
+
+        # Add gradient debug callback (prints true grad norm every step)
+        trainer.add_callback(GradientDebugCallback())
         
         # Train
         train_output = trainer.train()
@@ -248,3 +282,30 @@ class GRPOTrainingPipeline:
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
+
+    # ------------------------------------------------------------------
+    # Debug helpers
+    # ------------------------------------------------------------------
+    def _log_trainable_parameters(self):
+        """Log how many parameters are trainable vs. frozen for debugging."""
+        total_params = 0
+        trainable_params = 0
+        trainable_names = []
+        for n, p in self.model.named_parameters():
+            numel = p.numel()
+            total_params += numel
+            if p.requires_grad:
+                trainable_params += numel
+                if len(trainable_names) < 20:
+                    trainable_names.append(n)
+
+        perc_trainable = 100.0 * trainable_params / total_params if total_params else 0.0
+        logger.info("================ PARAMETER DEBUG ================")
+        logger.info(f"Total parameters: {total_params / 1e6:.2f} M")
+        logger.info(f"Trainable parameters: {trainable_params / 1e6:.2f} M ({perc_trainable:.2f}%)")
+        logger.info("Sample trainable parameter names (first 20):")
+        for name in trainable_names:
+            logger.info(f"  • {name}")
+        if trainable_params == 0:
+            logger.warning("⚠️  No trainable parameters found! The model appears to be fully frozen.")
+        logger.info("===============================================")
